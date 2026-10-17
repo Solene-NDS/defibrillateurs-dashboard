@@ -6,6 +6,8 @@ filters, funnel table and opening-hours reader.
 import pandas as pd
 import streamlit as st
 
+from utils.departments import DEPARTMENT_NAMES, department_label
+
 # Day codes used in the opening-hours text (Monday = 0 ... Sunday = 6)
 DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -19,6 +21,23 @@ FUNNEL_STEPS = [
     ("4. Equipment not expired", "step4_equipment"),
     ("5. Confirmed 24/7", "step5_24_7"),
 ]
+
+# Indicators the user can choose in the sidebar to compare departments
+# (label shown to the user -> column name in the department table)
+METRICS = {
+    "Confirmed 24/7 per 10,000 inhabitants": "confirmed_per_10k",
+    "Declared per 10,000 inhabitants": "declared_per_10k",
+    "% of working devices with no opening hours": "pct_hours_missing",
+    "% of working devices with expired equipment": "pct_expired",
+}
+
+# Status of each device on the detailed map, with one basic color each
+MAP_STATUS_COLORS = {
+    "Confirmed 24/7": "green",
+    "Limited hours": "blue",
+    "Opening hours not provided": "orange",
+    "Expired battery or electrodes": "red",
+}
 
 
 # ---------------------------------------------------------------- filters
@@ -45,6 +64,76 @@ def make_funnel(df):
     total = max(len(df), 1)  # avoid dividing by zero
     funnel["percent"] = (funnel["defibrillators"] / total * 100).round(1)
     return funnel
+
+
+# ---------------------------------------------------------------- departments
+def department_stats(df, population):
+    """
+    One row per department with counts, rates and a map position.
+    Only departments that have a population (official departments) are kept.
+    """
+    working = df["step3_working"]
+
+    # Helper columns: one True/False per thing we want to count
+    data = df.assign(
+        working=working,
+        expired=working & (df["equipment_status"] == "Expired"),
+        hours_missing=working & df["hours_category"].isin(["Not provided", "Unreadable"]),
+    )
+
+    # Count per department
+    stats = data.groupby("department").agg(
+        declared=("id", "size"),
+        working=("working", "sum"),
+        confirmed_24_7=("step5_24_7", "sum"),
+        expired=("expired", "sum"),
+        hours_missing=("hours_missing", "sum"),
+    ).reset_index()
+
+    # Map position of each department = median position of its defibrillators
+    positions = (df[df["valid_location"]]
+                 .groupby("department")[["lat", "lon"]]
+                 .median()
+                 .reset_index())
+
+    # Join: population (inner = keep only real departments), then positions
+    stats = population.merge(stats, on="department", how="inner")
+    stats = stats.merge(positions, on="department", how="left")
+
+    # Rates
+    stats["confirmed_per_10k"] = (stats["confirmed_24_7"] / stats["population"] * 10000).round(2)
+    stats["declared_per_10k"] = (stats["declared"] / stats["population"] * 10000).round(2)
+    working_count = stats["working"].where(stats["working"] > 0)  # avoid dividing by zero
+    stats["pct_hours_missing"] = (stats["hours_missing"] / working_count * 100).round(1)
+    stats["pct_expired"] = (stats["expired"] / working_count * 100).round(1)
+
+    # Readable label, e.g. "55 - Meuse"
+    stats["label"] = stats["department"].map(department_label)
+    return stats
+
+
+def known_departments(df):
+    """Sorted list of the official department codes present in the data."""
+    codes = df["department"].dropna().unique()
+    return sorted(code for code in codes if code in DEPARTMENT_NAMES)
+
+
+# ---------------------------------------------------------------- detailed map
+def map_points(df):
+    """Working devices with a valid location, with a status used for the map colors."""
+    points = df[df["step3_working"]].copy()
+
+    # One status per device (the first rule that matches wins)
+    points["map_status"] = "Limited hours"
+    points.loc[points["hours_category"].isin(["Not provided", "Unreadable"]),
+               "map_status"] = "Opening hours not provided"
+    points.loc[points["hours_category"] == "24/7", "map_status"] = "Confirmed 24/7"
+    points.loc[points["equipment_status"] == "Expired",
+               "map_status"] = "Expired battery or electrodes"
+
+    # Readable access type for the tooltip
+    points["access"] = points["access_type"].map({"Intérieur": "Indoor", "Extérieur": "Outdoor"})
+    return points
 
 
 # ---------------------------------------------------------------- opening hours
@@ -145,3 +234,21 @@ def open_at(df, day, hour):
     schedules = parse_all_hours(tuple(df["opening_hours"].dropna().unique()))
     open_map = {text: is_open(schedule, day, minute) for text, schedule in schedules.items()}
     return df["opening_hours"].map(open_map).fillna(False).astype(bool)
+
+
+def hourly_availability(df, days):
+    """
+    For each chosen day and each hour (0-23): how many ready-to-use devices are open?
+    Returns a table with columns: day, hour, open_devices, percent.
+    """
+    ready = df[df["step4_equipment"]]
+    total = max(len(ready), 1)
+
+    rows = []
+    for day in days:
+        for hour in range(24):
+            count = int(open_at(ready, day, hour).sum())
+            rows.append({"day": DAY_NAMES[day], "hour": hour,
+                         "open_devices": count,
+                         "percent": round(count / total * 100, 1)})
+    return pd.DataFrame(rows)
