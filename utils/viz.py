@@ -130,6 +130,27 @@ def ranking_bar(stats, metric, metric_label, n, france_value):
     return fig
 
 
+def missing_bar(missing):
+    """Horizontal bars: % of empty values for each important field."""
+    fig = px.bar(
+        missing.sort_values("percent"),
+        x="percent",
+        y="field",
+        orientation="h",
+        text="percent",
+        color_discrete_sequence=[COLOR_UNKNOWN],
+        labels={"percent": "Empty values (%)", "field": "Field"},
+        hover_data={"empty": ":,"},
+    )
+    fig.update_traces(texttemplate="%{text}%", textposition="outside")
+    # Reference line: above 50%, the field is missing for most devices
+    fig.add_vline(x=50, line_dash="dash", line_color=COLOR_BAD,
+                  annotation_text="Half of the devices", annotation_position="top")
+    fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=360,
+                      xaxis=dict(range=[0, 105]))
+    return fig
+
+
 def hourly_line(hourly, chosen_day, chosen_hour, baseline_percent):
     """Share of ready-to-use devices open at each hour, one line per day."""
     fig = px.line(

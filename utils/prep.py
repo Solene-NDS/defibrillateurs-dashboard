@@ -3,6 +3,7 @@ prep.py - Small data preparation functions used by the app:
 filters, funnel table and opening-hours reader.
 """
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -30,6 +31,12 @@ METRICS = {
     "% of working devices with no opening hours": "pct_hours_missing",
     "% of working devices with expired equipment": "pct_expired",
 }
+
+# Same reference date as in the cleaning notebook (used for expiry checks)
+REFERENCE_DATE = pd.Timestamp("2026-10-17")
+
+# A device more than this distance from the center of its department is suspicious
+FAR_FROM_DEPARTMENT_KM = 100
 
 # Status of each device on the detailed map, with one basic color each
 MAP_STATUS_COLORS = {
@@ -116,6 +123,81 @@ def known_departments(df):
     """Sorted list of the official department codes present in the data."""
     codes = df["department"].dropna().unique()
     return sorted(code for code in codes if code in DEPARTMENT_NAMES)
+
+
+# ---------------------------------------------------------------- data quality
+def missing_values(df):
+    """Percentage of empty values for the fields that matter for the story."""
+    fields = {
+        "Battery expiry date": df["battery_expiry"].isna(),
+        "Electrodes expiry date": df["electrodes_expiry"].isna(),
+        "Installation date": df["install_date"].isna(),
+        "Status (active / inactive)": df["status"].isna(),
+        "City INSEE code": df["insee_code"].isna(),
+        # The default value "Mo-Su off" is counted as empty (see the cleaning notebook)
+        "Opening hours": df["hours_category"] == "Not provided",
+        "Last maintenance date": df["last_maintenance"].isna(),
+    }
+    rows = [{"field": name, "empty": int(is_empty.sum()),
+             "percent": round(is_empty.mean() * 100, 1)}
+            for name, is_empty in fields.items()]
+    return pd.DataFrame(rows)
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    """Distance in km between two points on Earth (haversine formula)."""
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
+
+
+def far_from_department(df):
+    """True/False column: is the device more than 100 km from the center of its department?"""
+    located = df[df["valid_location"] & df["department"].notna()]
+    # Center of each department = median position of its devices
+    centers = located.groupby("department")[["lat", "lon"]].median()
+    center_lat = df["department"].map(centers["lat"])
+    center_lon = df["department"].map(centers["lon"])
+
+    distance = distance_km(df["lat"], df["lon"], center_lat, center_lon)
+    return df["valid_location"] & (distance > FAR_FROM_DEPARTMENT_KM)
+
+
+def quality_checks(df, population):
+    """Table of validation checks: what we tested, how many rows fail, and what we did."""
+    n = max(len(df), 1)
+    no_population = ~df["department"].isin(population["department"])
+
+    checks = [
+        ("Flagged as duplicate in the database", df["is_duplicate"],
+         "Removed at funnel step 1"),
+        ("Not validated yet (pending or doubtful)", df["validation_status"] != "validées",
+         "Removed at funnel step 1"),
+        ("Marked 'to delete'", df["status"] == "A supprimer",
+         "Removed at funnel step 1"),
+        ("Mobile device (no fixed place)", df["is_mobile"],
+         "Removed at funnel step 1"),
+        ("Coordinates missing, equal to 0 or outside France", ~df["valid_location"],
+         "Removed at funnel step 2"),
+        (f"Located more than {FAR_FROM_DEPARTMENT_KM} km from its department", far_from_department(df),
+         "Kept, but its department may be wrong"),
+        ("Department not found or not an official department", no_population,
+         "Kept on the map, no 'per 10,000 inhabitants' value"),
+        ("Opening hours = default value ('Mo-Su off')", df["hours_category"] == "Not provided",
+         "Treated as 'not provided', not as 'closed'"),
+        ("Opening hours text unreadable", df["hours_category"] == "Unreadable",
+         "Not confirmed open"),
+        ("Battery or electrodes expired", df["equipment_status"] == "Expired",
+         "Removed at funnel step 4"),
+        ("Last maintenance date in the future", df["last_maintenance"] > REFERENCE_DATE,
+         "Kept, date considered as a typo"),
+    ]
+
+    rows = [{"Check": name, "Rows": int(failed.sum()),
+             "% of rows": round(failed.sum() / n * 100, 1), "Action": action}
+            for name, failed, action in checks]
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------- detailed map
